@@ -22,6 +22,7 @@ No external dependencies — stdlib only.
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -30,9 +31,36 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# ── Force UTF-8 stdout/stderr on Windows ──────────────────────────────────────
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# ── Load .env from skill directory ────────────────────────────────────────────
+SKILL_DIR = Path(__file__).resolve().parent
+
+def _load_env(env_path: Path) -> None:
+    """Minimal .env loader (stdlib only). Reads KEY=VALUE lines into os.environ."""
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:  # don't override existing env vars
+            os.environ[key] = value
+
+_load_env(SKILL_DIR / ".env")
+
 # ── Notion config ─────────────────────────────────────────────────────────────
-NOTION_VERSION = "2025-09-03"
-DATA_SOURCE_ID = "32148a58-db8b-804d-8a3e-000bc86acd54"
+NOTION_VERSION = "2026-03-11"
+DATA_SOURCE_ID = os.environ.get("NOTION_DATA_SOURCE_ID", "32148a58-db8b-804d-8a3e-000bc86acd54")
 RATE_LIMIT_DELAY = 0.3
 
 DEFAULT_STATUSES = ["To apply", "Deciding", "Networking"]
@@ -46,12 +74,9 @@ def get_notion_key() -> str:
     key = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_KEY")
     if key:
         return key
-    keyfile = Path("~/.config/notion/api_key").expanduser()
-    if keyfile.exists():
-        return keyfile.read_text().strip()
     sys.exit(
         "❌ Notion API key not found.\n"
-        "   Set NOTION_API_KEY env var, or write the key to ~/.config/notion/api_key"
+        "   Set NOTION_API_KEY in .claude/skills/job-db/.env"
     )
 
 
@@ -105,7 +130,7 @@ def query_jobs(key: str, statuses: list[str] | None) -> list[dict]:
 
     result = notion_request(
         "POST",
-        f"/databases/{DATA_SOURCE_ID}/query",
+        f"/data_sources/{DATA_SOURCE_ID}/query",
         key,
         payload,
     )

@@ -19,18 +19,46 @@ No external dependencies — stdlib only.
 """
 
 import argparse
+import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+# ── Force UTF-8 stdout/stderr on Windows ──────────────────────────────────────
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# ── Load .env from skill directory ────────────────────────────────────────────
+SKILL_DIR = Path(__file__).resolve().parent
+
+def _load_env(env_path: Path) -> None:
+    """Minimal .env loader (stdlib only). Reads KEY=VALUE lines into os.environ."""
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:  # don't override existing env vars
+            os.environ[key] = value
+
+_load_env(SKILL_DIR / ".env")
+
 # ── Notion config ─────────────────────────────────────────────────────────────
-NOTION_VERSION = "2025-09-03"
-DATABASE_ID = "32148a58-db8b-8070-a094-ea8d8d13d4df"
-BLOCK_CHUNK_SIZE = 1900
+NOTION_VERSION = "2026-03-11"
+DATA_SOURCE_ID = os.environ.get("NOTION_DATA_SOURCE_ID", "32148a58-db8b-804d-8a3e-000bc86acd54")
 RATE_LIMIT_DELAY = 0.4
 MAX_BLOCKS_PER_REQUEST = 100
 
@@ -41,12 +69,9 @@ def get_notion_key() -> str:
     key = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_KEY")
     if key:
         return key
-    keyfile = Path("~/.config/notion/api_key").expanduser()
-    if keyfile.exists():
-        return keyfile.read_text().strip()
     sys.exit(
         "❌ Notion API key not found.\n"
-        "   Set NOTION_API_KEY env var, or write the key to ~/.config/notion/api_key"
+        "   Set NOTION_API_KEY in .claude/skills/job-db/.env"
     )
 
 
@@ -70,17 +95,75 @@ def notion_request(method: str, path: str, key: str, data: dict | None = None) -
 
 # ── Text / block helpers ──────────────────────────────────────────────────────
 
-def chunk_text(text: str, size: int = BLOCK_CHUNK_SIZE) -> list[str]:
+# Patterns that look like section headers in a plain-text JD
+_HEADER_RE = re.compile(
+    r"^(?:"
+    r"about\b|the (?:role|company|team|opportunity|position)|"
+    r"responsibilit|requirements?|qualifications?|"
+    r"what (?:you|we|they)|your (?:skills|experience|background)|"
+    r"key (?:skills|requirements|responsibilities)|"
+    r"who (?:you|we)|why (?:join|work|us)|"
+    r"benefits?|perks|compensation|"
+    r"nice.to.have|preferred|minimum|essential|desirable|"
+    r"how to apply|next steps|overview|summary|"
+    r"our (?:mission|values|culture|team|stack|technology)"
+    r")",
+    re.IGNORECASE,
+)
+
+_BULLET_RE = re.compile(r"^(?:[-*•·–—]|\d{1,2}[.)]\s)")
+
+
+def _is_header(line: str) -> bool:
+    """Heuristic: short line that looks like a section title."""
+    if len(line) > 80 or len(line) < 3:
+        return False
+    # Matches known header patterns
+    if _HEADER_RE.search(line):
+        return True
+    # Short line ending with colon (e.g. "Responsibilities:")
+    if line.endswith(":") and len(line) < 60:
+        return True
+    return False
+
+
+def _is_bullet(line: str) -> bool:
+    return bool(_BULLET_RE.match(line.strip()))
+
+
+def _strip_bullet(line: str) -> str:
+    return _BULLET_RE.sub("", line.strip()).strip()
+
+
+def _make_rich_text(text: str) -> list[dict]:
+    """Build a rich_text array, chunking if text exceeds the 2000-char Notion limit."""
     chunks = []
-    while len(text) > size:
-        split_at = text.rfind("\n", 0, size)
+    while len(text) > 2000:
+        split_at = text.rfind(" ", 0, 2000)
         if split_at <= 0:
-            split_at = size
+            split_at = 2000
         chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    if text.strip():
+        text = text[split_at:].lstrip()
+    if text:
         chunks.append(text)
-    return chunks
+    return [{"text": {"content": c}} for c in chunks]
+
+
+def _para_block(text: str) -> dict:
+    return {"object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": _make_rich_text(text)}}
+
+
+def _heading_block(text: str) -> dict:
+    # Strip trailing colon for cleaner headings
+    display = text.rstrip(":").strip()
+    return {"object": "block", "type": "heading_3",
+            "heading_3": {"rich_text": [{"text": {"content": display[:2000]}}]}}
+
+
+def _bullet_block(text: str) -> dict:
+    return {"object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": _make_rich_text(text)}}
 
 
 def build_jd_blocks(description: str) -> list[dict]:
@@ -92,21 +175,69 @@ def build_jd_blocks(description: str) -> list[dict]:
         }
     ]
     if not description or description.startswith("⚠️"):
-        blocks.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"text": {"content": description or "No description available."}}]
-            },
-        })
+        blocks.append(_para_block(description or "No description available."))
         return blocks
 
-    for chunk in chunk_text(description):
-        blocks.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {"rich_text": [{"text": {"content": chunk}}]},
-        })
+    # Split on blank lines to get natural paragraphs
+    paragraphs = re.split(r"\n\s*\n", description.strip())
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        lines = para.split("\n")
+
+        # Single-line paragraph: check if it's a header or bullet
+        if len(lines) == 1:
+            line = lines[0].strip()
+            if _is_header(line):
+                blocks.append(_heading_block(line))
+            elif _is_bullet(line):
+                blocks.append(_bullet_block(_strip_bullet(line)))
+            else:
+                blocks.append(_para_block(line))
+            continue
+
+        # Multi-line paragraph: could be a mix of header + content, or a list
+        all_bullets = all(_is_bullet(l.strip()) for l in lines if l.strip())
+
+        if all_bullets:
+            # Entire paragraph is a list
+            for l in lines:
+                l = l.strip()
+                if l:
+                    blocks.append(_bullet_block(_strip_bullet(l)))
+        elif _is_header(lines[0].strip()) and len(lines) > 1:
+            # First line is a header, rest is content
+            blocks.append(_heading_block(lines[0].strip()))
+            remaining = "\n".join(lines[1:]).strip()
+            # Check if the remaining lines are all bullets
+            rem_lines = [l for l in lines[1:] if l.strip()]
+            if rem_lines and all(_is_bullet(l.strip()) for l in rem_lines):
+                for l in rem_lines:
+                    blocks.append(_bullet_block(_strip_bullet(l.strip())))
+            else:
+                blocks.append(_para_block(remaining))
+        else:
+            # Regular multi-line paragraph — render line by line,
+            # promoting bullets where detected
+            buf = []
+            for l in lines:
+                l_stripped = l.strip()
+                if not l_stripped:
+                    continue
+                if _is_bullet(l_stripped):
+                    # Flush any accumulated text first
+                    if buf:
+                        blocks.append(_para_block(" ".join(buf)))
+                        buf = []
+                    blocks.append(_bullet_block(_strip_bullet(l_stripped)))
+                else:
+                    buf.append(l_stripped)
+            if buf:
+                blocks.append(_para_block(" ".join(buf)))
+
     return blocks
 
 
@@ -169,7 +300,7 @@ def push_job(job: dict, key: str) -> str | None:
         name_text["link"] = {"url": job_url}
 
     page_payload = {
-        "parent": {"database_id": DATABASE_ID},
+        "parent": {"type": "data_source_id", "data_source_id": DATA_SOURCE_ID},
         "properties": {
             "Name": {"title": [{"text": name_text}]},
             "Company": {"rich_text": [{"text": {"content": company}}]},
@@ -326,7 +457,7 @@ def main() -> None:
     if not json_path.exists():
         sys.exit(f"❌ File not found: {json_path}")
 
-    raw = json.loads(json_path.read_text())
+    raw = json.loads(json_path.read_text(encoding="utf-8"))
     jobs: list[dict] = raw.get("jobs", raw) if isinstance(raw, dict) else raw
     jobs = sorted(jobs, key=lambda j: get_score(j), reverse=True)
 
