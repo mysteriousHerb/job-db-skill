@@ -159,6 +159,10 @@ def push_job(job: dict, key: str) -> str | None:
     job_url = job.get("job_url") or ""
     description = job.get("description") or "⚠️ Description not available — visit URL."
     comments = build_comments(job)
+    salary = job.get("salary") or ""
+    workplace_type = job.get("workplace_type") or ""
+    posted_time = job.get("posted_time") or ""
+    applicants = job.get("applicants") or ""
 
     name_text: dict = {"content": title}
     if job_url:
@@ -174,6 +178,22 @@ def push_job(job: dict, key: str) -> str | None:
             "comments": {"rich_text": [{"text": {"content": comments}}]},
         },
     }
+
+    # Add salary if available
+    if salary:
+        page_payload["properties"]["Salary"] = {"rich_text": [{"text": {"content": salary}}]}
+
+    # Add workplace type if available
+    if workplace_type:
+        page_payload["properties"]["Workplace Type"] = {"rich_text": [{"text": {"content": workplace_type}}]}
+
+    # Add posted time if available
+    if posted_time:
+        page_payload["properties"]["Posted"] = {"rich_text": [{"text": {"content": posted_time}}]}
+
+    # Add applicant count if available
+    if applicants:
+        page_payload["properties"]["Applicants"] = {"rich_text": [{"text": {"content": applicants}}]}
 
     page = notion_request("POST", "/pages", key, page_payload)
     if not page:
@@ -198,17 +218,17 @@ def push_job(job: dict, key: str) -> str | None:
 def score_label(job: dict) -> str:
     score = get_score(job)
     if score >= 9:
-        return f"🎯 {score}"
+        return f"(*) {score}"
     if score >= 8:
-        return f"💪 {score}"
+        return f"(+) {score}"
     if score >= 7:
-        return f"✅ {score}"
-    return f"🤔 {score}"
+        return f"(/) {score}"
+    return f"(?) {score}"
 
 
 def print_job_list(jobs: list[dict]) -> None:
     print(f"\n  {'#':<4} {'Score':<8} {'Title':<44} {'Company':<24} Location")
-    print("  " + "─" * 106)
+    print("  " + "-" * 106)
     for i, job in enumerate(jobs, 1):
         print(
             f"  {i:<4} {score_label(job):<8} "
@@ -220,21 +240,52 @@ def print_job_list(jobs: list[dict]) -> None:
 
 
 def find_latest_score_results() -> Path | None:
-    """Walk up from cwd to find skills/job-scout/output/latest/score_results_latest.json."""
+    """Find the most recent score_results.json in dated archive directories."""
+    import glob
+    from datetime import datetime
+
+    # Look for score_results.json in dated archive directories
     candidates = [
-        Path("skills/job-scout/output/latest/score_results_latest.json"),
-        Path(".claude/skills/job-scout/output/latest/score_results_latest.json"),
+        Path("skills/job-scout/output/archive/*/score_results.json"),
+        Path(".claude/skills/job-scout/output/archive/*/score_results.json"),
+        Path("skills/job-scout/output/runs/*/score_results.json"),
+        Path(".claude/skills/job-scout/output/runs/*/score_results.json"),
     ]
+
     # Also search relative to this script's location
     script_dir = Path(__file__).parent
     candidates += [
-        script_dir / "../../job-scout/output/latest/score_results_latest.json",
-        script_dir / "../job-scout/output/latest/score_results_latest.json",
+        script_dir / "../../job-scout/output/archive/*/score_results.json",
+        script_dir / "../job-scout/output/archive/*/score_results.json",
+        script_dir / "../../job-scout/output/runs/*/score_results.json",
+        script_dir / "../job-scout/output/runs/*/score_results.json",
     ]
-    for p in candidates:
-        resolved = p.resolve()
-        if resolved.exists():
-            return resolved
+
+    all_found = []
+    for pattern in candidates:
+        matches = glob.glob(str(pattern))
+        for match in matches:
+            path = Path(match)
+            if path.exists():
+                # Extract date from path (assuming YYYYMMDD format)
+                parts = str(path.parent).split('/')
+                date_part = [p for p in parts if len(p) == 8 and p.isdigit() and p.startswith('20')][-1:]  # Take last 8-digit sequence that starts with '20'
+                if date_part:
+                    try:
+                        date_obj = datetime.strptime(date_part[0], "%Y%m%d")
+                        all_found.append((date_obj, path))
+                    except ValueError:
+                        # If parsing fails, just use the modification time
+                        all_found.append((datetime.fromtimestamp(path.stat().st_mtime), path))
+                else:
+                    # If no date part found, use modification time
+                    all_found.append((datetime.fromtimestamp(path.stat().st_mtime), path))
+
+    if all_found:
+        # Return the most recent one
+        all_found.sort(key=lambda x: x[0], reverse=True)
+        return all_found[0][1]
+
     return None
 
 
@@ -247,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "json_file",
         nargs="?",
-        help="Path to score_results JSON. Defaults to skills/job-scout/output/latest/score_results_latest.json",
+        help="Path to score_results JSON. Defaults to most recent dated archive in skills/job-scout/output/archive/",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--jobs", metavar="N,N,...", help="Comma-separated job numbers to push")
@@ -267,7 +318,7 @@ def main() -> None:
         json_path = find_latest_score_results()
         if not json_path:
             sys.exit(
-                "❌ Could not find score_results_latest.json.\n"
+                "❌ Could not find score_results.json in dated archives.\n"
                 "   Pass the path explicitly or run from the repo root."
             )
         print(f"  Using: {json_path}")

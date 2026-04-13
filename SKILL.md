@@ -91,6 +91,10 @@ If the user names specific companies or roles, prefer `--company` / `--title` ov
 | Company | `Company` property | `company` |
 | Location | `Location` property | `location` |
 | Status | `Status` property | hardcoded `"To apply"` |
+| Salary | `Salary` property | `salary` |
+| Workplace Type | `Workplace Type` property | `workplace_type` |
+| Posted Time | `Posted` property | `posted_time` |
+| Applicant Count | `Applicants` property | `applicants` |
 | Score + breakdown + summary | `comments` property (≤2000 chars) | `score`, `scoring_breakdown`, `summary` |
 | Full job description | Page body (blocks) | `description` |
 
