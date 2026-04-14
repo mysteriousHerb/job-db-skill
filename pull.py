@@ -24,12 +24,11 @@ No external dependencies — stdlib only.
 import argparse
 import io
 import json
-import os
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+from common import get_data_source_id, get_notion_key, notion_request
 
 # ── Force UTF-8 stdout/stderr on Windows ──────────────────────────────────────
 if sys.stdout.encoding != "utf-8":
@@ -37,30 +36,6 @@ if sys.stdout.encoding != "utf-8":
 if sys.stderr.encoding != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# ── Load .env from skill directory ────────────────────────────────────────────
-SKILL_DIR = Path(__file__).resolve().parent
-
-def _load_env(env_path: Path) -> None:
-    """Minimal .env loader (stdlib only). Reads KEY=VALUE lines into os.environ."""
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip("'\"")
-        if key and key not in os.environ:  # don't override existing env vars
-            os.environ[key] = value
-
-_load_env(SKILL_DIR / ".env")
-
-# ── Notion config ─────────────────────────────────────────────────────────────
-NOTION_VERSION = "2026-03-11"
-DATA_SOURCE_ID = os.environ.get("NOTION_DATA_SOURCE_ID", "32148a58-db8b-804d-8a3e-000bc86acd54")
 RATE_LIMIT_DELAY = 0.3
 
 DEFAULT_STATUSES = ["To apply", "Deciding", "Networking"]
@@ -68,37 +43,8 @@ DEFAULT_STATUSES = ["To apply", "Deciding", "Networking"]
 CV_BUILDER_ROOT = Path(__file__).parent.parent / "cv_builder"
 
 
-# ── Notion API ────────────────────────────────────────────────────────────────
-
-def get_notion_key() -> str:
-    key = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_KEY")
-    if key:
-        return key
-    sys.exit(
-        "❌ Notion API key not found.\n"
-        "   Set NOTION_API_KEY in .claude/skills/job-db/.env"
-    )
-
-
-def notion_request(method: str, path: str, key: str, data: dict | None = None) -> dict | None:
-    url = f"https://api.notion.com/v1{path}"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        print(f"  ❌ Notion API error {e.code}: {error_body}", file=sys.stderr)
-        return None
-
-
 # ── Notion helpers ────────────────────────────────────────────────────────────
+
 
 def prop_text(prop: dict) -> str:
     """Extract plain text from a Notion property value."""
@@ -117,7 +63,9 @@ def prop_text(prop: dict) -> str:
 def query_jobs(key: str, statuses: list[str] | None) -> list[dict]:
     """Query the Notion database for tracked jobs."""
     if statuses:
-        status_filters = [{"property": "Status", "status": {"equals": s}} for s in statuses]
+        status_filters = [
+            {"property": "Status", "status": {"equals": s}} for s in statuses
+        ]
         filt = {"or": status_filters} if len(status_filters) > 1 else status_filters[0]
     else:
         filt = {}
@@ -130,7 +78,7 @@ def query_jobs(key: str, statuses: list[str] | None) -> list[dict]:
 
     result = notion_request(
         "POST",
-        f"/data_sources/{DATA_SOURCE_ID}/query",
+        f"/data_sources/{get_data_source_id()}/query",
         key,
         payload,
     )
@@ -158,7 +106,11 @@ def fetch_page_jd(page_id: str, key: str) -> str:
     while result.get("has_more"):
         cursor = result.get("next_cursor")
         time.sleep(RATE_LIMIT_DELAY)
-        result = notion_request("GET", f"/blocks/{page_id}/children?page_size=100&start_cursor={cursor}", key)
+        result = notion_request(
+            "GET",
+            f"/blocks/{page_id}/children?page_size=100&start_cursor={cursor}",
+            key,
+        )
         if not result:
             break
         for block in result.get("results", []):
@@ -185,6 +137,7 @@ def parse_job(page: dict) -> dict:
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────────
+
 
 def print_job_list(jobs: list[dict]) -> None:
     print(f"\n  {'#':<4} {'Status':<14} {'Title':<44} {'Company':<24} Location")
@@ -224,9 +177,10 @@ def make_job_title(job: dict) -> str:
 def make_file_stem(job_title: str) -> str:
     """Convert 'Head of AI - Acme Corp' → 'Head_of_AI_Acme_Corp'."""
     import re
-    stem = re.sub(r"[^\w\s-]", "", job_title)   # strip punctuation except hyphen/space
-    stem = re.sub(r"[\s\-]+", "_", stem.strip()) # spaces and hyphens → underscore
-    return stem[:80]                              # cap length
+
+    stem = re.sub(r"[^\w\s-]", "", job_title)  # strip punctuation except hyphen/space
+    stem = re.sub(r"[\s\-]+", "_", stem.strip())  # spaces and hyphens → underscore
+    return stem[:80]  # cap length
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,12 +189,33 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--company", metavar="NAME", help="Filter by company name (case-insensitive substring)")
-    parser.add_argument("--title", metavar="TEXT", help="Filter by title substring (case-insensitive)")
-    parser.add_argument("--status", metavar="STATUS", help="Filter by a single status (default: To apply, Deciding, Networking)")
-    parser.add_argument("--all-statuses", action="store_true", help="Show jobs of all statuses")
-    parser.add_argument("--out", metavar="PATH", help="Output path for request.json (default: cv_builder/input/request.json)")
-    parser.add_argument("--pick", metavar="N", type=int, help="Auto-pick job number N (skip interactive prompt)")
+    parser.add_argument(
+        "--company",
+        metavar="NAME",
+        help="Filter by company name (case-insensitive substring)",
+    )
+    parser.add_argument(
+        "--title", metavar="TEXT", help="Filter by title substring (case-insensitive)"
+    )
+    parser.add_argument(
+        "--status",
+        metavar="STATUS",
+        help="Filter by a single status (default: To apply, Deciding, Networking)",
+    )
+    parser.add_argument(
+        "--all-statuses", action="store_true", help="Show jobs of all statuses"
+    )
+    parser.add_argument(
+        "--out",
+        metavar="PATH",
+        help="Output path for request.json (default: cv_builder/input/request.json)",
+    )
+    parser.add_argument(
+        "--pick",
+        metavar="N",
+        type=int,
+        help="Auto-pick job number N (skip interactive prompt)",
+    )
     return parser.parse_args()
 
 
@@ -256,11 +231,15 @@ def main() -> None:
     else:
         statuses = DEFAULT_STATUSES
 
-    print(f"\n  Querying Notion{'  (all statuses)' if not statuses else '  (' + ', '.join(statuses) + ')'}...")
+    print(
+        f"\n  Querying Notion{'  (all statuses)' if not statuses else '  (' + ', '.join(statuses) + ')'}..."
+    )
     pages = query_jobs(key, statuses)
 
     if not pages:
-        sys.exit("  ⚠️  No jobs found. Try --all-statuses or check your Notion database.")
+        sys.exit(
+            "  ⚠️  No jobs found. Try --all-statuses or check your Notion database."
+        )
 
     jobs = [parse_job(p) for p in pages]
 
@@ -296,10 +275,12 @@ def main() -> None:
 
     # Strip the "Job Description" heading block if present
     if jd.startswith("Job Description"):
-        jd = jd[len("Job Description"):].lstrip()
+        jd = jd[len("Job Description") :].lstrip()
 
     if not jd or jd.startswith("⚠️"):
-        print(f"  ⚠️  JD is empty or unavailable in Notion. The job may not have been pushed with a description.")
+        print(
+            f"  ⚠️  JD is empty or unavailable in Notion. The job may not have been pushed with a description."
+        )
         sys.exit(1)
 
     print(f"  ✅ JD fetched ({len(jd)} chars)\n")
@@ -340,9 +321,13 @@ def main() -> None:
     jd_abs = jd_path.resolve()
     print("  Run cv_builder with (pick either):")
     print(f"\n    # Option A — request file (includes job_title):")
-    print(f"    cd \"{cv_root}\" && uv run python generate_cv.py --request-file \"{req_path}\" --additional-info-mode auto")
+    print(
+        f'    cd "{cv_root}" && uv run python generate_cv.py --request-file "{req_path}" --additional-info-mode auto'
+    )
     print(f"\n    # Option B — plain JD file:")
-    print(f"    cd \"{cv_root}\" && uv run python generate_cv.py --job-description-file \"{jd_abs}\" '{job_title}' --additional-info-mode auto\n")
+    print(
+        f'    cd "{cv_root}" && uv run python generate_cv.py --job-description-file "{jd_abs}" \'{job_title}\' --additional-info-mode auto\n'
+    )
 
 
 if __name__ == "__main__":

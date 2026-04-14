@@ -5,10 +5,13 @@ description: Job database skill — push selected jobs from a job-scout score_re
 
 # job-db
 
-The bridge between job-scout and cv_builder. Two modes:
+The bridge between job-scout and cv_builder. Three modes:
 
+- **filter** — Remove jobs that are already tracked in Notion before `job-scout` spends time scoring them.
 - **push** — After reviewing a scout run, call `push.py` to upload selected jobs to Notion. Reads `score_results_latest.json` directly — no re-fetching, no LinkedIn scraping needed. The full JD is already in the JSON.
 - **pull** — Read tracked jobs from Notion (including saved JDs) and hand off to cv_builder.
+
+All Notion-related logic lives here. Other skills should delegate to `job-db` rather than calling the Notion API themselves.
 
 ---
 
@@ -29,6 +32,27 @@ Do NOT re-scrape LinkedIn or re-fetch URLs. The `description` field in that JSON
 No install needed — `push.py` uses stdlib only. Run with plain `python3`.
 
 Requires `NOTION_API_KEY` at `~/.config/notion/api_key` or in the environment.
+
+---
+
+## Mode 0: Filter — remove Notion duplicates
+
+**Trigger:** internal `job-scout` pipeline step before scoring.
+
+Run from the repo root:
+
+```bash
+python3 .claude/skills/job-db/filter_notion_duplicates.py path/to/all_jobs.json --output path/to/all_jobs.filtered.json
+```
+
+What it does:
+
+1. Queries the Notion jobs database.
+2. Matches existing entries by normalized URL first.
+3. Falls back to company + fuzzy title matching.
+4. Returns only jobs that are not already tracked.
+
+`job-scout/scripts/run_job_scout.py` calls this script directly, so Notion dedup now lives entirely in `job-db`.
 
 ---
 

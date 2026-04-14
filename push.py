@@ -21,13 +21,12 @@ No external dependencies — stdlib only.
 import argparse
 import io
 import json
-import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+from common import get_data_source_id, get_notion_key, notion_request
 
 # ── Force UTF-8 stdout/stderr on Windows ──────────────────────────────────────
 if sys.stdout.encoding != "utf-8":
@@ -35,62 +34,8 @@ if sys.stdout.encoding != "utf-8":
 if sys.stderr.encoding != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# ── Load .env from skill directory ────────────────────────────────────────────
-SKILL_DIR = Path(__file__).resolve().parent
-
-def _load_env(env_path: Path) -> None:
-    """Minimal .env loader (stdlib only). Reads KEY=VALUE lines into os.environ."""
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip("'\"")
-        if key and key not in os.environ:  # don't override existing env vars
-            os.environ[key] = value
-
-_load_env(SKILL_DIR / ".env")
-
-# ── Notion config ─────────────────────────────────────────────────────────────
-NOTION_VERSION = "2026-03-11"
-DATA_SOURCE_ID = os.environ.get("NOTION_DATA_SOURCE_ID", "32148a58-db8b-804d-8a3e-000bc86acd54")
 RATE_LIMIT_DELAY = 0.4
 MAX_BLOCKS_PER_REQUEST = 100
-
-
-# ── Notion API ────────────────────────────────────────────────────────────────
-
-def get_notion_key() -> str:
-    key = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_KEY")
-    if key:
-        return key
-    sys.exit(
-        "❌ Notion API key not found.\n"
-        "   Set NOTION_API_KEY in .claude/skills/job-db/.env"
-    )
-
-
-def notion_request(method: str, path: str, key: str, data: dict | None = None) -> dict | None:
-    url = f"https://api.notion.com/v1{path}"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        print(f"  ❌ Notion API error {e.code}: {error_body}", file=sys.stderr)
-        return None
 
 
 # ── Text / block helpers ──────────────────────────────────────────────────────
@@ -150,20 +95,29 @@ def _make_rich_text(text: str) -> list[dict]:
 
 
 def _para_block(text: str) -> dict:
-    return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": _make_rich_text(text)}}
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": _make_rich_text(text)},
+    }
 
 
 def _heading_block(text: str) -> dict:
     # Strip trailing colon for cleaner headings
     display = text.rstrip(":").strip()
-    return {"object": "block", "type": "heading_3",
-            "heading_3": {"rich_text": [{"text": {"content": display[:2000]}}]}}
+    return {
+        "object": "block",
+        "type": "heading_3",
+        "heading_3": {"rich_text": [{"text": {"content": display[:2000]}}]},
+    }
 
 
 def _bullet_block(text: str) -> dict:
-    return {"object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": _make_rich_text(text)}}
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": _make_rich_text(text)},
+    }
 
 
 def build_jd_blocks(description: str) -> list[dict]:
@@ -243,9 +197,12 @@ def build_jd_blocks(description: str) -> list[dict]:
 
 # ── Score field extraction ────────────────────────────────────────────────────
 
+
 def get_score(job: dict) -> float:
     """Supports both schema versions: 'score' (current) and 'overall_score'/'fit_score' (legacy)."""
-    return float(job.get("score") or job.get("overall_score") or job.get("fit_score") or 0)
+    return float(
+        job.get("score") or job.get("overall_score") or job.get("fit_score") or 0
+    )
 
 
 def build_comments(job: dict) -> str:
@@ -260,7 +217,12 @@ def build_comments(job: dict) -> str:
         penalties = breakdown.get("penalties") or []
         parts = [f"Score: {score}/10"]
         if bonuses:
-            parts.append("+" + "; +".join(b.split(": +", 1)[-1] if ": +" in b else b for b in bonuses[:3]))
+            parts.append(
+                "+"
+                + "; +".join(
+                    b.split(": +", 1)[-1] if ": +" in b else b for b in bonuses[:3]
+                )
+            )
         if penalties:
             parts.append("-" + "; -".join(p for p in penalties[:2]))
         header = " | ".join(parts)
@@ -282,6 +244,7 @@ def build_comments(job: dict) -> str:
 
 # ── Notion push ───────────────────────────────────────────────────────────────
 
+
 def push_job(job: dict, key: str) -> str | None:
     """Create a Notion page for one job. Returns the page URL on success."""
     title = job.get("title") or "Unknown Role"
@@ -300,7 +263,7 @@ def push_job(job: dict, key: str) -> str | None:
         name_text["link"] = {"url": job_url}
 
     page_payload = {
-        "parent": {"type": "data_source_id", "data_source_id": DATA_SOURCE_ID},
+        "parent": {"type": "data_source_id", "data_source_id": get_data_source_id()},
         "properties": {
             "Name": {"title": [{"text": name_text}]},
             "Company": {"rich_text": [{"text": {"content": company}}]},
@@ -312,19 +275,27 @@ def push_job(job: dict, key: str) -> str | None:
 
     # Add salary if available
     if salary:
-        page_payload["properties"]["Salary"] = {"rich_text": [{"text": {"content": salary}}]}
+        page_payload["properties"]["Salary"] = {
+            "rich_text": [{"text": {"content": salary}}]
+        }
 
     # Add workplace type if available
     if workplace_type:
-        page_payload["properties"]["Workplace Type"] = {"rich_text": [{"text": {"content": workplace_type}}]}
+        page_payload["properties"]["Workplace Type"] = {
+            "rich_text": [{"text": {"content": workplace_type}}]
+        }
 
     # Add posted time if available
     if posted_time:
-        page_payload["properties"]["Posted"] = {"rich_text": [{"text": {"content": posted_time}}]}
+        page_payload["properties"]["Posted"] = {
+            "rich_text": [{"text": {"content": posted_time}}]
+        }
 
     # Add applicant count if available
     if applicants:
-        page_payload["properties"]["Applicants"] = {"rich_text": [{"text": {"content": applicants}}]}
+        page_payload["properties"]["Applicants"] = {
+            "rich_text": [{"text": {"content": applicants}}]
+        }
 
     page = notion_request("POST", "/pages", key, page_payload)
     if not page:
@@ -345,6 +316,7 @@ def push_job(job: dict, key: str) -> str | None:
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
 
 def score_label(job: dict) -> str:
     score = get_score(job)
@@ -399,18 +371,26 @@ def find_latest_score_results() -> Path | None:
             path = Path(match)
             if path.exists():
                 # Extract date from path (assuming YYYYMMDD format)
-                parts = str(path.parent).split('/')
-                date_part = [p for p in parts if len(p) == 8 and p.isdigit() and p.startswith('20')][-1:]  # Take last 8-digit sequence that starts with '20'
+                parts = str(path.parent).split("/")
+                date_part = [
+                    p
+                    for p in parts
+                    if len(p) == 8 and p.isdigit() and p.startswith("20")
+                ][-1:]  # Take last 8-digit sequence that starts with '20'
                 if date_part:
                     try:
                         date_obj = datetime.strptime(date_part[0], "%Y%m%d")
                         all_found.append((date_obj, path))
                     except ValueError:
                         # If parsing fails, just use the modification time
-                        all_found.append((datetime.fromtimestamp(path.stat().st_mtime), path))
+                        all_found.append(
+                            (datetime.fromtimestamp(path.stat().st_mtime), path)
+                        )
                 else:
                     # If no date part found, use modification time
-                    all_found.append((datetime.fromtimestamp(path.stat().st_mtime), path))
+                    all_found.append(
+                        (datetime.fromtimestamp(path.stat().st_mtime), path)
+                    )
 
     if all_found:
         # Return the most recent one
@@ -432,11 +412,25 @@ def parse_args() -> argparse.Namespace:
         help="Path to score_results JSON. Defaults to most recent dated archive in skills/job-scout/output/archive/",
     )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--jobs", metavar="N,N,...", help="Comma-separated job numbers to push")
-    group.add_argument("--min-score", type=float, metavar="N", help="Push all jobs with score >= N")
-    group.add_argument("--all", action="store_true", dest="push_all", help="Push all jobs in the file")
-    group.add_argument("--company", metavar="NAME", help="Push jobs where company name contains NAME (case-insensitive)")
-    group.add_argument("--title", metavar="TEXT", help="Push jobs where title contains TEXT (case-insensitive)")
+    group.add_argument(
+        "--jobs", metavar="N,N,...", help="Comma-separated job numbers to push"
+    )
+    group.add_argument(
+        "--min-score", type=float, metavar="N", help="Push all jobs with score >= N"
+    )
+    group.add_argument(
+        "--all", action="store_true", dest="push_all", help="Push all jobs in the file"
+    )
+    group.add_argument(
+        "--company",
+        metavar="NAME",
+        help="Push jobs where company name contains NAME (case-insensitive)",
+    )
+    group.add_argument(
+        "--title",
+        metavar="TEXT",
+        help="Push jobs where title contains TEXT (case-insensitive)",
+    )
     return parser.parse_args()
 
 
@@ -477,14 +471,24 @@ def main() -> None:
             sys.exit("❌ --jobs expects comma-separated integers, e.g. --jobs 1,3,5")
     elif args.company:
         needle = args.company.lower()
-        indices = [i for i, j in enumerate(jobs) if needle in (j.get("company") or "").lower()]
-        print(f"  Matched {len(indices)} job(s) with company containing '{args.company}'.\n")
+        indices = [
+            i for i, j in enumerate(jobs) if needle in (j.get("company") or "").lower()
+        ]
+        print(
+            f"  Matched {len(indices)} job(s) with company containing '{args.company}'.\n"
+        )
     elif args.title:
         needle = args.title.lower()
-        indices = [i for i, j in enumerate(jobs) if needle in (j.get("title") or "").lower()]
-        print(f"  Matched {len(indices)} job(s) with title containing '{args.title}'.\n")
+        indices = [
+            i for i, j in enumerate(jobs) if needle in (j.get("title") or "").lower()
+        ]
+        print(
+            f"  Matched {len(indices)} job(s) with title containing '{args.title}'.\n"
+        )
     else:
-        print("  ℹ️  Listing only. To push, add --jobs 1,3 / --min-score 8 / --all / --company NAME / --title TEXT\n")
+        print(
+            "  ℹ️  Listing only. To push, add --jobs 1,3 / --min-score 8 / --all / --company NAME / --title TEXT\n"
+        )
         return
 
     if not indices:
@@ -493,7 +497,9 @@ def main() -> None:
 
     out_of_range = [i + 1 for i in indices if i < 0 or i >= len(jobs)]
     if out_of_range:
-        sys.exit(f"❌ Job number(s) out of range: {out_of_range}  (file has {len(jobs)} jobs)")
+        sys.exit(
+            f"❌ Job number(s) out of range: {out_of_range}  (file has {len(jobs)} jobs)"
+        )
 
     key = get_notion_key()
     selected = [(i, jobs[i]) for i in indices]
@@ -502,7 +508,7 @@ def main() -> None:
     pushed, failed = [], []
 
     for i, job in selected:
-        label = f"[{i+1}] {job.get('title')} — {job.get('company')}"
+        label = f"[{i + 1}] {job.get('title')} — {job.get('company')}"
         print(f"  {label[:72]:<72} ", end="", flush=True)
         page_url = push_job(job, key)
         if page_url:
@@ -513,7 +519,7 @@ def main() -> None:
             failed.append(job)
         time.sleep(RATE_LIMIT_DELAY)
 
-    print(f"\n  {'─'*60}")
+    print(f"\n  {'─' * 60}")
     print(f"  ✅ Pushed:  {len(pushed)}")
     if failed:
         print(f"  ❌ Failed:  {len(failed)}")
